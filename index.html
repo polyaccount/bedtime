@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Bedtime Stories</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: #000; color: #8a8f98; font-family: system-ui, sans-serif; }
+  body { padding: 16px 16px 40px; max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; color: #9aa0aa; margin: 8px 0 16px; }
+  #player-wrap { display: none; margin-bottom: 18px; }
+  #player-wrap.on { display: block; }
+  #now { font-size: 15px; color: #b3b8c2; margin: 0 0 10px; }
+  .frame { position: relative; width: 100%; aspect-ratio: 16 / 9; min-height: 200px; background: #111; border-radius: 10px; overflow: hidden; }
+  .frame iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  #status { font-size: 13px; color: #5f6570; margin-top: 8px; min-height: 18px; }
+  #stop { margin-top: 10px; background: #1a1c20; color: #9aa0aa; border: 1px solid #2a2d33; border-radius: 10px; padding: 12px 16px; font-size: 15px; width: 100%; }
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+  li button { width: 100%; text-align: left; background: #0e0f12; color: #b3b8c2; border: 1px solid #22252b; border-radius: 12px; padding: 16px; font-size: 17px; line-height: 1.3; }
+  li button:active { background: #16181c; }
+  li button.playing { border-color: #3d5a80; color: #d6dbe4; }
+  li .sub { display: block; font-size: 13px; color: #5f6570; margin-top: 4px; }
+  li button[disabled] { opacity: .35; }
+</style>
+</head>
+<body>
+
+<h1>🌙 Bedtime Stories</h1>
+
+<div id="player-wrap">
+  <p id="now"></p>
+  <div class="frame" id="frame"></div>
+  <div id="status"></div>
+  <button id="stop" type="button">Stop</button>
+</div>
+
+<ul id="list"></ul>
+
+<script>
+/* =====================================================================
+   EDIT THIS LIST TO ADD OR REMOVE STORIES
+   - title: anything you like
+   - url:   paste the YouTube link (any form works: youtube.com/watch?v=...,
+            youtu.be/..., or just the 11-character video ID)
+   Keep the commas between entries. Entries with an empty url are greyed out.
+   ===================================================================== */
+const STORIES = [
+  { title: "Book 8 – Hard Luck",        url: "https://www.youtube.com/watch?v=8QhE1U6AyKg" },
+  { title: "Book 9 – The Long Haul",    url: "https://www.youtube.com/watch?v=edHLfI5A5Gw" },
+  { title: "Book 10 – Old School",      url: "https://www.youtube.com/watch?v=ywAe122UCVY" },
+  { title: "Book 11 – Double Down",     url: "https://www.youtube.com/watch?v=BS67GsImrjQ" },
+  { title: "Book 12 – The Getaway",     url: "https://www.youtube.com/watch?v=43KIRBcYdZw" },
+  { title: "Book 13 – The Meltdown",    url: "https://www.youtube.com/watch?v=efaN6fTAM14" },
+  { title: "Book 14 – Wrecking Ball",   url: "https://www.youtube.com/watch?v=d-dusGqG9aU" },
+  { title: "Book 15 – The Deep End",    url: "https://www.youtube.com/watch?v=m-GOhkqhge4" },
+  { title: "Book 16 – Big Shot",        url: "https://www.youtube.com/watch?v=-ZDzCf-JYbE" },
+  { title: "Book 17 – Diper Överlöde",  url: "https://www.youtube.com/watch?v=n77b1RBCKBQ" },
+  // To add more, copy a line above and change the title and link.
+];
+/* ===================================================================== */
+
+const ORIGIN = "https://www.youtube-nocookie.com";
+const FALLBACK_AWAKE_MS = 2.5 * 60 * 60 * 1000; // if player state can't be read, let the screen sleep after 2.5 h
+
+function videoId(url) {
+  if (!url) return null;
+  url = url.trim();
+  if (/^[\w-]{11}$/.test(url)) return url;
+  const m = url.match(/(?:v=|youtu\.be\/|embed\/|shorts\/|live\/)([\w-]{11})/);
+  return m ? m[1] : null;
+}
+
+function fmt(sec) {
+  sec = Math.floor(sec || 0);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60);
+  return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+}
+
+const store = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+/* ---------- keep the screen awake only while a story is playing ---------- */
+let wakeLock = null, wantAwake = false, fallbackTimer = null;
+
+async function lockScreenAwake() {
+  wantAwake = true;
+  if (!("wakeLock" in navigator) || wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } catch { /* not supported or not allowed */ }
+}
+function releaseScreen() {
+  wantAwake = false;
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && wantAwake) lockScreenAwake();
+});
+
+/* ---------- player ---------- */
+const wrap = document.getElementById("player-wrap");
+const frame = document.getElementById("frame");
+const nowEl = document.getElementById("now");
+const statusEl = document.getElementById("status");
+let current = null, iframe = null, lastSaved = 0, gotEvents = false;
+
+function play(story, id, btn) {
+  stop(false);
+  current = { id, title: story.title, btn };
+  document.querySelectorAll("li button").forEach(b => b.classList.toggle("playing", b === btn));
+  nowEl.textContent = story.title;
+  wrap.classList.add("on");
+
+  const saved = store.get("pos:" + id) || 0;
+  const start = saved > 30 ? Math.floor(saved - 10) : 0; // resume a little before where it stopped
+  statusEl.textContent = start ? `Resuming from ${fmt(start)}` : "";
+
+  const params = new URLSearchParams({
+    autoplay: "1", playsinline: "1", rel: "0", modestbranding: "1",
+    enablejsapi: "1", origin: location.origin, start: String(start),
+  });
+  iframe = document.createElement("iframe");
+  iframe.src = `${ORIGIN}/embed/${id}?${params}`;
+  iframe.allow = "autoplay; encrypted-media; picture-in-picture";
+  iframe.referrerPolicy = "strict-origin-when-cross-origin"; // YouTube needs to see which site is embedding it
+  iframe.title = story.title;
+  iframe.addEventListener("load", () => {
+    // ask the player to send us its state (this is what YouTube's own API does)
+    iframe.contentWindow.postMessage(JSON.stringify({ event: "listening", id: 1, channel: "widget" }), ORIGIN);
+  });
+  frame.appendChild(iframe);
+
+  gotEvents = false;
+  lockScreenAwake();
+  clearTimeout(fallbackTimer);
+  fallbackTimer = setTimeout(() => { if (!gotEvents) releaseScreen(); }, FALLBACK_AWAKE_MS);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function stop(hide = true) {
+  if (iframe) { iframe.remove(); iframe = null; }
+  releaseScreen();
+  clearTimeout(fallbackTimer);
+  if (hide) {
+    wrap.classList.remove("on");
+    document.querySelectorAll("li button").forEach(b => b.classList.remove("playing"));
+    current = null;
+  }
+}
+document.getElementById("stop").addEventListener("click", () => stop(true));
+
+window.addEventListener("message", (e) => {
+  if (e.origin !== ORIGIN || !current) return;
+  let data; try { data = JSON.parse(e.data); } catch { return; }
+  const info = data && data.info;
+  if (!info) return;
+  gotEvents = true;
+
+  if (typeof info.currentTime === "number" && Date.now() - lastSaved > 5000) {
+    store.set("pos:" + current.id, info.currentTime);
+    lastSaved = Date.now();
+  }
+  if (typeof info.playerState === "number") {
+    // 1 = playing, 2 = paused, 0 = ended, 3 = buffering
+    if (info.playerState === 1 || info.playerState === 3) lockScreenAwake();
+    if (info.playerState === 2) { releaseScreen(); statusEl.textContent = "Paused"; }
+    if (info.playerState === 1) statusEl.textContent = "";
+    if (info.playerState === 0) {
+      releaseScreen();
+      store.set("pos:" + current.id, 0);
+      statusEl.textContent = "Finished — goodnight 🌙";
+    }
+  }
+});
+
+/* ---------- list ---------- */
+const list = document.getElementById("list");
+STORIES.forEach(story => {
+  const id = videoId(story.url);
+  const li = document.createElement("li");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = story.title;
+  const sub = document.createElement("span");
+  sub.className = "sub";
+  if (!id) {
+    btn.disabled = true;
+    sub.textContent = "No link yet";
+  } else {
+    const pos = store.get("pos:" + id);
+    sub.textContent = pos > 30 ? `Listened to ${fmt(pos)}` : "";
+    btn.addEventListener("click", () => play(story, id, btn));
+  }
+  btn.appendChild(sub);
+  li.appendChild(btn);
+  list.appendChild(li);
+});
+</script>
+</body>
+</html>
